@@ -134,6 +134,17 @@ class Watchdog:
                     
                     routing = RoutingManager("")
                     routing.teardown_routing()
+
+                    # Split tunneling has its own helper process, routes and
+                    # marking rules. They are removed here as well, otherwise a
+                    # crash would leave the excluded applications with no
+                    # working route at all.
+                    try:
+                        from pvpn_cli.split import manager as split_manager
+
+                        split_manager.teardown(log=self._log)
+                    except Exception as split_error:
+                        self._log(f"Split tunneling cleanup error: {split_error}")
                     
                     if os.path.exists(self.state_file):
                         os.remove(self.state_file)

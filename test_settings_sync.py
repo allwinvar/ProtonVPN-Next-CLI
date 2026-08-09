@@ -95,7 +95,7 @@ class SettingsBridgeTest(unittest.TestCase):
 
         self.assertEqual("proton", self.db.get_setting("active_dns_profile"))
 
-    def test_items_are_ignored_while_the_switch_is_off(self):
+    def test_items_are_preserved_while_the_switch_is_off(self):
         self.write_split(
             {"exclude_lan": True, "split_items": [{"type": "ip", "value": "10.0.0.5"}]}
         )
@@ -103,7 +103,11 @@ class SettingsBridgeTest(unittest.TestCase):
 
         config = RoutingManager("")._get_split_config()
 
-        self.assertEqual([], config["split_items"])
+        # Turning the feature off must not destroy the user's configured list.
+        # Enforcement is suppressed by build_targets(), not by mutating config.
+        self.assertEqual(
+            [{"type": "ip", "value": "10.0.0.5/32"}], config["split_items"]
+        )
         self.assertTrue(config["exclude_lan"])
 
     def test_items_apply_while_the_switch_is_on(self):
@@ -111,7 +115,10 @@ class SettingsBridgeTest(unittest.TestCase):
         self.write_split({"exclude_lan": False, "split_items": items})
         self.db.set_setting("split_tunneling", "true")
 
-        self.assertEqual(items, RoutingManager("")._get_split_config()["split_items"])
+        self.assertEqual(
+            [{"type": "ip", "value": "10.0.0.5/32"}],
+            RoutingManager("")._get_split_config()["split_items"],
+        )
 
     def test_lists_predating_the_switch_keep_working(self):
         self.write_split(
@@ -125,7 +132,7 @@ class SettingsBridgeTest(unittest.TestCase):
 
         self.assertFalse(split_tunneling_enabled(db=self.db))
 
-    def test_include_mode_keeps_traffic_in_the_tunnel(self):
+    def test_include_mode_preserves_items_for_policy_routing(self):
         self.write_split(
             {
                 "exclude_lan": False,
@@ -135,7 +142,10 @@ class SettingsBridgeTest(unittest.TestCase):
         )
         self.db.set_setting("split_tunneling", "true")
 
-        self.assertEqual([], RoutingManager("")._get_split_config()["split_items"])
+        self.assertEqual(
+            [{"type": "app", "value": "/usr/bin/curl"}],
+            RoutingManager("")._get_split_config()["split_items"],
+        )
 
 
 class SettingsRouteTest(unittest.TestCase):

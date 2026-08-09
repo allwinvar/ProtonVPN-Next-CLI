@@ -14,12 +14,20 @@ DESTDIR ?=
 LIBDIR ?= $(PREFIX)/lib/pvpn-next
 BINDIR ?= $(PREFIX)/bin
 
-.PHONY: all build install clean
+.PHONY: all build install clean windivert build-split-windows
 
 all: build
 
 build:
 	cd engine && $(LINUX_GO_BUILD_CMD) -o pvpn-engine helper.go setup_linux.go
+
+# Download the signed WinDivert driver used by the split-tunneling helper.
+# Skipped silently when the files are already in place.
+windivert:
+	sh scripts/fetch-windivert.sh engine
+
+build-split-windows: windivert
+	cd engine && GOOS=windows GOARCH=amd64 $(GO_BUILD_CMD) -o pvpn-split.exe ./splitter
 
 build-windows-docker:
 	DOCKER_BUILDKIT=1 docker build --build-arg NPROCS=$(NPROCS) -f Dockerfile.windows --output dist/ .
@@ -27,11 +35,12 @@ build-windows-docker:
 
 build-windows:
 	cd engine && GOOS=windows GOARCH=amd64 $(GO_BUILD_CMD) -o pvpn-engine.exe helper.go setup_windows.go
+	$(MAKE) build-split-windows
 	python3 -m venv .venv
 	./.venv/bin/python -m ensurepip --upgrade
 	./.venv/bin/python -m pip install pyinstaller
 	./.venv/bin/python -m pip install -r requirements.txt
-	./.venv/bin/python -m PyInstaller --noconfirm --onedir --name pvpn-next --icon=icon.ico --version-file version_info.txt --add-data "engine/pvpn-engine.exe:engine" --add-data "engine/wintun.dll:engine" pvpn-next
+	./.venv/bin/python -m PyInstaller --noconfirm --onedir --name pvpn-next --icon=icon.ico --version-file version_info.txt --add-data "engine/pvpn-engine.exe:engine" --add-data "engine/wintun.dll:engine" --add-data "engine/pvpn-split.exe:engine" --add-data "engine/WinDivert.dll:engine" --add-data "engine/WinDivert64.sys:engine" --collect-submodules pvpn_cli.split pvpn-next
 
 build-linux-bin:
 	cd engine && $(LINUX_GO_BUILD_CMD) -o pvpn-engine helper.go setup_linux.go
@@ -39,7 +48,7 @@ build-linux-bin:
 	./.venv/bin/python -m ensurepip --upgrade
 	./.venv/bin/python -m pip install pyinstaller
 	./.venv/bin/python -m pip install -r requirements.txt
-	./.venv/bin/python -m PyInstaller --noconfirm --onefile --name pvpn-next-linux --add-data "engine/pvpn-engine:engine" pvpn-next
+	./.venv/bin/python -m PyInstaller --noconfirm --onefile --name pvpn-next-linux --add-data "engine/pvpn-engine:engine" --collect-submodules pvpn_cli.split pvpn-next
 
 install: build
 	# Create directories
@@ -66,4 +75,4 @@ install: build
 	chmod 644 $(DESTDIR)$(PREFIX)/lib/systemd/system/pvpn-next-privileged.service
 
 clean:
-	rm -f engine/pvpn-engine
+	rm -f engine/pvpn-engine engine/pvpn-engine.exe engine/pvpn-split.exe

@@ -51,6 +51,7 @@ from pvpn_cli.cli.commands.split_tunnel import (
     do_exclude_lan,
     do_novpn,
     do_pid_scanner,
+    do_split_agent,
     do_split_tunneling,
 )
 from pvpn_cli.cli.commands.wizard import do_autosetup, do_grant_privileges
@@ -147,14 +148,32 @@ def run_cli(args_list=None):
     
     # split-tunneling command
     parser_split = subparsers.add_parser("split-tunneling", help="Manage split tunneling for apps, domains, and IPs")
-    parser_split.add_argument("action", choices=["list", "add", "remove", "on", "off"], help="Action to perform")
-    parser_split.add_argument("value", nargs="?", help="Domain, IP, or Absolute Path to app binary (for add/remove)")
+    parser_split.add_argument(
+        "action",
+        choices=["list", "add", "remove", "on", "off", "mode", "status", "reconcile"],
+        help="Action to perform",
+    )
+    parser_split.add_argument(
+        "value",
+        nargs="?",
+        help="Domain, IP/CIDR, app path or name; 'exclude'/'include' for mode",
+    )
+    parser_split.add_argument(
+        "--type",
+        dest="item_type",
+        choices=["app", "ip", "domain"],
+        help="Force the item type instead of detecting it",
+    )
     
     # novpn wrapper
     parser_novpn = subparsers.add_parser("novpn", help="Run a command bypassing the VPN (Linux only)")
     parser_novpn.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to run")
     
-    # pid scanner (hidden internal command)
+    # split tunneling agent (hidden internal command)
+    parser_split_agent = subparsers.add_parser("_split-agent", help=argparse.SUPPRESS)
+    parser_split_agent.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
+
+    # deprecated alias of _split-agent (hidden internal command)
     parser_scanner = subparsers.add_parser("_pid-scanner", help=argparse.SUPPRESS)
     
     # daemon (hidden internal command)
@@ -311,7 +330,7 @@ def run_cli(args_list=None):
     elif args.command == "exclude-lan":
         do_exclude_lan(args.state)
     elif args.command == "split-tunneling":
-        do_split_tunneling(args.action, args.value)
+        sys.exit(do_split_tunneling(args.action, args.value, args.item_type) or 0)
     elif args.command == "autosetup":
         proxy = None
         if args.proxy_cf:
@@ -328,6 +347,8 @@ def run_cli(args_list=None):
             print("[ERROR] Command required for novpn")
             sys.exit(1)
         do_novpn(args.cmd)
+    elif args.command == "_split-agent":
+        sys.exit(do_split_agent(["--once"] if args.once else []) or 0)
     elif args.command == "_pid-scanner":
         do_pid_scanner()
     elif args.command == "_daemon":
@@ -489,3 +510,7 @@ def main():
             import traceback
             traceback.print_exc()
             sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

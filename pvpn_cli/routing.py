@@ -108,29 +108,32 @@ def stage_frozen_engine(engine_path: str, runtime_dir: str = "/run/pvpn-next") -
 
 
 def load_split_config() -> dict:
-    """Read split_tunnel.json, the file shared by the CLI and the GUI."""
-    config_path = os.path.join(get_config_dir(), "split_tunnel.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                return loaded
-        except (OSError, ValueError):
-            pass
-    return {"exclude_lan": False, "split_items": []}
+    """Read the split tunneling configuration.
+
+    Kept as a thin wrapper for existing callers: the file itself is owned by
+    pvpn_cli.split.model, which validates and migrates it. The returned dict
+    still carries the legacy ``split_items`` key so older call sites keep
+    working unchanged.
+    """
+    from pvpn_cli.split import model
+
+    config = model.load_config()
+    return dict(
+        config,
+        split_items=[
+            {"type": item["type"], "value": item["value"]}
+            for item in config.get("items", [])
+            if item.get("enabled", True)
+        ],
+    )
 
 
 def split_tunneling_enabled(config=None, db=None) -> bool:
     """The item list lives in split_tunnel.json, the master switch in the
     database. Lists created before the switch existed keep working."""
-    from pvpn_cli.database import Database
+    from pvpn_cli.split import model
 
-    raw = (db or Database()).get_setting("split_tunneling")
-    if raw is None:
-        config = load_split_config() if config is None else config
-        return bool(config.get("split_items"))
-    return raw == "true"
+    return model.master_enabled(config, db=db)
 
 
 class RoutingManager:
@@ -207,43 +210,26 @@ class RoutingManager:
         return None
 
     def _get_split_config(self):
+        """Snapshot the split configuration before privileges are dropped.
+
+        Both routing modes are honoured now. Include mode used to be discarded
+        with a warning, which is why selecting it appeared to do nothing.
+        """
         config = load_split_config()
-        if not split_tunneling_enabled(config):
-            if config.get("split_items"):
-                print("-> Split tunneling is switched off, so its items are ignored.")
-            return dict(config, split_items=[])
-        if config.get("mode") == "include":
-            # Routing can only keep traffic out of the tunnel. Applying the list
-            # here would route exactly the wrong side, so keep everything in.
-            print("[WARNING] Split tunneling 'include' mode is not supported yet, so all traffic stays in the VPN.")
-            return dict(config, split_items=[])
+        if not split_tunneling_enabled(config) and config.get("split_items"):
+            print("-> Split tunneling is switched off, so its items are ignored.")
         return config
 
     def _resolve_ips(self, items):
-        ips = []
-        apps = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            item_type = item.get("type")
-            value = item.get("value")
-            if not isinstance(value, str):
-                continue
-            if item_type == "ip":
-                try:
-                    ips.append(str(ipaddress.ip_network(value, strict=False)))
-                except ValueError:
-                    print(f"[WARNING] Ignoring invalid split-tunnel network: {value}")
-            elif item_type == "domain":
-                try:
-                    resolved = socket.gethostbyname_ex(value)[2]
-                    ips.extend(str(ipaddress.ip_address(ip)) for ip in resolved)
-                    print(f"-> Resolved domain {value} to {resolved}")
-                except (socket.gaierror, ValueError):
-                    print(f"[WARNING] Could not resolve domain: {value}")
-            elif item_type == "app":
-                apps.append(value)
-        return ips, apps
+        """Legacy helper: resolve stored items into networks and app matchers.
+
+        Domains resolve to both address families here, and CIDR blocks keep
+        their prefix length instead of collapsing into a single host.
+        """
+        from pvpn_cli.split import model
+
+        targets = model.build_targets(config={"items": items, "enabled": True})
+        return list(targets.v4) + list(targets.v6), list(targets.apps)
 
     def start_vpn(self, vpn_ip: str, engine_path: str, config_path: str, log_path: str, awg_ip: str = "10.2.0.2", awg_iface: str = "awg0", dns_ips: str = "10.2.0.1", split_cfg=None, db_allow_lan=None):
         # The broker reads server/settings data from a user-owned database. Treat
@@ -264,6 +250,19 @@ class RoutingManager:
             from pvpn_cli.database import Database
             db_allow_lan = Database().get_setting("allow_lan", "false") == "true"
         exclude_lan = split_cfg.get("exclude_lan", False) or db_allow_lan
+
+        # Plan split tunneling before touching the network. Include mode needs
+        # to be known this early because it decides whether the tunnel gets a
+        # catch-all default route at all.
+        from pvpn_cli.split import manager as split_manager
+
+        split_targets = split_manager.plan(
+            allow_lan=db_allow_lan,
+            config=split_cfg,
+        )
+        split_route_everything = split_manager.routes_all_traffic(split_targets)
+        for warning in split_targets.warnings:
+            print(f"[WARNING] {warning}")
         try:
             dns_list = [str(ipaddress.ip_address(ip.strip())) for ip in dns_ips.split(",") if ip.strip()]
         except ValueError as exc:
@@ -349,32 +348,41 @@ class RoutingManager:
                 # Setup routes
                 self._run_cmd(["route", "ADD", vpn_ip, "MASK", "255.255.255.255", gw])
                 
-                for ip in exclude_ips:
-                    self._run_cmd(["route", "ADD", ip, "MASK", "255.255.255.255", gw])
-                if exclude_lan:
-                    self._run_cmd(["route", "ADD", "10.0.0.0", "MASK", "255.0.0.0", gw])
-                    self._run_cmd(["route", "ADD", "172.16.0.0", "MASK", "255.240.0.0", gw])
-                    self._run_cmd(["route", "ADD", "192.168.0.0", "MASK", "255.255.0.0", gw])
+                # Exclusions are installed by pvpn_cli.split.manager once the
+                # tunnel exists. It uses real prefix lengths instead of forcing a
+                # /32 on every entry, and never writes to the registry, so
+                # nothing it creates can survive a reboot.
                 
                 if iface_idx:
-                    self._run_cmd(["route", "ADD", "0.0.0.0", "MASK", "128.0.0.0", "0.0.0.0", "IF", iface_idx])
-                    self._run_cmd(["route", "ADD", "128.0.0.0", "MASK", "128.0.0.0", "0.0.0.0", "IF", iface_idx])
+                    if split_route_everything:
+                        self._run_cmd(["route", "ADD", "0.0.0.0", "MASK", "128.0.0.0", "0.0.0.0", "IF", iface_idx])
+                        self._run_cmd(["route", "ADD", "128.0.0.0", "MASK", "128.0.0.0", "0.0.0.0", "IF", iface_idx])
                     
                     try:
                         # netsh defaults to store=persistent, which would leave a dead
                         # IPv6 default route in the registry after a crash or a BSOD.
-                        self._run_cmd(["netsh", "interface", "ipv6", "add", "route", "::/0", awg_iface, "metric=1", "store=active"], silent=True)
+                        if split_route_everything:
+                            self._run_cmd(["netsh", "interface", "ipv6", "add", "route", "::/0", awg_iface, "metric=1", "store=active"], silent=True)
                     except:
                         pass
                     
                     if dns_list:
                         with open(client_log_path, "a") as f:
                             self._windows_apply_dns(awg_iface, dns_list, f)
-                else:
+                elif split_route_everything:
+                    # Fallback route via awg0 IP if index not found. Include
+                    # mode deliberately keeps the physical default route.
                     self._run_cmd(["route", "ADD", "0.0.0.0", "MASK", "128.0.0.0", awg_ip])
                     self._run_cmd(["route", "ADD", "128.0.0.0", "MASK", "128.0.0.0", awg_ip])
                 
-                print("-> Routing configured successfully. All traffic is now secured.")
+                self._apply_split_tunneling(
+                    awg_iface, awg_ip, db_allow_lan, split_targets
+                )
+
+                if split_route_everything:
+                    print("-> Routing configured successfully. All traffic is now secured.")
+                else:
+                    print("-> Routing configured successfully. Only the selected traffic uses the VPN.")
                 print("-> VPN is running in the background. Use 'disconnect' to stop.")
             
         else:
@@ -388,38 +396,16 @@ class RoutingManager:
                 raise RuntimeError("Invalid default gateway") from exc
             if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", iface):
                 raise RuntimeError("Invalid physical interface name")
-            if exclude_apps and os.environ.get("PVPN_SERVICE_CHILD") == "1":
-                raise RuntimeError(
-                    "App-based split tunneling is not available through the hardened service; "
-                    "use LAN, IP or domain exclusions"
-                )
-                
             state["gw"] = gw
             state["iface"] = iface
-            
-            # Setup bash commands for excluded IPs and LAN
-            split_cmds = []
-            for ip in exclude_ips:
-                split_cmds.append(
-                    f"ip route add {shlex.quote(ip)} via {shlex.quote(gw)} dev {shlex.quote(iface)}"
-                )
-            if exclude_lan:
-                split_cmds.append(f"ip route add 10.0.0.0/8 via {shlex.quote(gw)} dev {shlex.quote(iface)}")
-                split_cmds.append(f"ip route add 172.16.0.0/12 via {shlex.quote(gw)} dev {shlex.quote(iface)}")
-                split_cmds.append(f"ip route add 192.168.0.0/16 via {shlex.quote(gw)} dev {shlex.quote(iface)}")
-                
-            if exclude_apps:
-                state["cgroup_created"] = True
-                # Setup cgroup v2 hierarchy and routing
-                split_cmds.extend([
-                    "mkdir -p /sys/fs/cgroup/protonvpn_exclude",
-                    # Enable fwmark matching for this cgroup
-                    "iptables -t mangle -C OUTPUT -m cgroup --path protonvpn_exclude -j MARK --set-mark 51820 2>/dev/null || iptables -t mangle -A OUTPUT -m cgroup --path protonvpn_exclude -j MARK --set-mark 51820",
-                    "ip rule add fwmark 51820 table 200",
-                    f"ip route add default via {shlex.quote(gw)} dev {shlex.quote(iface)} table 200"
-                ])
-                
-            split_cmds_str = "\n".join(split_cmds)
+
+            # Every split-tunneling object is created after the tunnel is up by
+            # pvpn_cli.split.manager, which owns cgroups, packet marking and
+            # policy routing for both address families. Keeping it out of this
+            # shell script means a failure there can no longer leave the
+            # connection half-configured, and app rules now work through the
+            # hardened broker too, since the broker child already runs as root.
+            split_cmds_str = ""
             
             # --- Stateless IPv6 and DNS ---
             # We don't save any state because routes attached to awg0 will automatically vanish when it dies.
@@ -471,6 +457,21 @@ done
                         "VPN engine exited immediately after launch"
                         + (f": {details.strip()}" if details else "")
                     )
+            # In include mode only the selected traffic belongs in the tunnel,
+            # so the physical default route has to stay where it is.
+            if split_route_everything:
+                catch_all_v4 = (
+                    f"ip route add 0.0.0.0/1 dev {shlex.quote(awg_iface)}\n"
+                    f"ip route add 128.0.0.0/1 dev {shlex.quote(awg_iface)}"
+                )
+                catch_all_v6 = (
+                    f"ip -6 route add default dev {shlex.quote(awg_iface)} metric 1 "
+                    "2>/dev/null || true"
+                )
+            else:
+                catch_all_v4 = "# include mode: the physical default route stays in place"
+                catch_all_v6 = "# include mode: no tunnel IPv6 default route"
+
             script = f"""
 # Wait for the userspace engine to create its TUN interface.
 for i in $(seq 1 30); do
@@ -481,12 +482,11 @@ if ! ip link show {shlex.quote(awg_iface)} >/dev/null 2>&1; then
     cat {shlex.quote(client_log_path)} >&2
     exit 1
 fi
-ip -6 route add default dev {shlex.quote(awg_iface)} metric 1 2>/dev/null || true
+{catch_all_v6}
 {dns_setup_script}
 ip route add {shlex.quote(vpn_ip)} via {shlex.quote(gw)} dev {shlex.quote(iface)}
 {split_cmds_str}
-ip route add 0.0.0.0/1 dev {shlex.quote(awg_iface)}
-ip route add 128.0.0.0/1 dev {shlex.quote(awg_iface)}
+{catch_all_v4}
 echo "-> Routing configured successfully. All traffic is now secured."
 echo "-> VPN is running in the background. Use 'disconnect' to stop."
 """
@@ -498,13 +498,9 @@ echo "-> VPN is running in the background. Use 'disconnect' to stop."
                     pass
                 sys.exit(result.returncode)
             
-            # Launch PID scanner in background if needed
-            if exclude_apps:
-                env = os.environ.copy()
-                for k in ["_MEIPASS", "_MEIPASS1", "_MEIPASS2", "_MEIPASS3"]:
-                    env.pop(k, None)
-                scanner_cmd = [sys.executable, os.path.realpath(sys.argv[0]), "_pid-scanner"]
-                subprocess.Popen(scanner_cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._apply_split_tunneling(
+                awg_iface, awg_ip, db_allow_lan, split_targets
+            )
 
     def _windows_purge_dns_state(self, awg_iface: str = "awg0", log=None) -> None:
         """Remove every persistent DNS artefact this app can leave on Windows.
@@ -587,7 +583,55 @@ echo "-> VPN is running in the background. Use 'disconnect' to stop."
         if log:
             log.write("--- End DNS Setup ---\n")
 
+    def _apply_split_tunneling(self, awg_iface, awg_ip, db_allow_lan, targets=None):
+        """Hand the tunnel over to the split-tunneling subsystem.
+
+        Runs after the tunnel is up and never raises: a problem here must not
+        bring down a working VPN connection, it must be reported.
+        """
+        from pvpn_cli.split import manager as split_manager
+
+        if targets is not None and targets.empty():
+            split_manager.teardown()
+            return
+        try:
+            result = split_manager.apply(
+                tunnel_interface=awg_iface,
+                tunnel_ip4=awg_ip,
+                allow_lan=db_allow_lan,
+                targets=targets,
+                log=lambda message: print(message, flush=True),
+            )
+        except Exception as exc:
+            print(f"[WARNING] Split tunneling could not be applied: {exc}")
+            return
+        for warning in result.get("warnings", []):
+            print(f"[WARNING] {warning}")
+        if result.get("active"):
+            state = result.get("state", {})
+            print(
+                "-> Split tunneling active in {mode} mode: "
+                "{apps} apps, {networks} networks.".format(
+                    mode=state.get("mode"),
+                    apps=len(state.get("apps", [])),
+                    networks=len(state.get("networks", [])),
+                )
+            )
+
+    def _teardown_split_tunneling(self):
+        from pvpn_cli.split import manager as split_manager
+
+        try:
+            split_manager.teardown(log=lambda message: print(message, flush=True))
+        except Exception as exc:
+            print(f"[WARNING] Split tunneling teardown error: {exc}")
+
     def teardown_routing(self):
+        # Split artifacts have their own state file and helper process. Remove
+        # them even when routing_state.json was lost, truncated, or belongs to
+        # an older build; this is essential after a crash or reboot.
+        self._teardown_split_tunneling()
+
         if not os.path.exists(self.state_file):
             return
             
@@ -610,12 +654,6 @@ echo "-> VPN is running in the background. Use 'disconnect' to stop."
             if state.get("os") == "win32":
                 gw = state.get("gw")
                 self._run_cmd(["route", "DELETE", vpn_ip, "MASK", "255.255.255.255", gw])
-                for ip in exclude_ips:
-                    self._run_cmd(["route", "DELETE", ip, "MASK", "255.255.255.255", gw])
-                if exclude_lan:
-                    self._run_cmd(["route", "DELETE", "10.0.0.0", "MASK", "255.0.0.0"])
-                    self._run_cmd(["route", "DELETE", "172.16.0.0", "MASK", "255.240.0.0"])
-                    self._run_cmd(["route", "DELETE", "192.168.0.0", "MASK", "255.255.0.0"])
                 self._run_cmd(["route", "DELETE", "0.0.0.0", "MASK", "128.0.0.0"])
                 self._run_cmd(["route", "DELETE", "128.0.0.0", "MASK", "128.0.0.0"])
                 
@@ -628,17 +666,11 @@ echo "-> VPN is running in the background. Use 'disconnect' to stop."
                 iface = state.get("iface")
                 if gw and iface:
                     subprocess.run(self._elevate(["ip", "route", "del", vpn_ip, "via", gw, "dev", iface]), capture_output=True)
-                    for ip in exclude_ips:
-                        subprocess.run(self._elevate(["ip", "route", "del", ip, "via", gw, "dev", iface]), capture_output=True)
-                    if exclude_lan:
-                        subprocess.run(self._elevate(["ip", "route", "del", "10.0.0.0/8", "via", gw, "dev", iface]), capture_output=True)
-                        subprocess.run(self._elevate(["ip", "route", "del", "172.16.0.0/12", "via", gw, "dev", iface]), capture_output=True)
-                        subprocess.run(self._elevate(["ip", "route", "del", "192.168.0.0/16", "via", gw, "dev", iface]), capture_output=True)
-                        
-                if state.get("cgroup_created"):
-                    subprocess.run(self._elevate(["iptables", "-t", "mangle", "-D", "OUTPUT", "-m", "cgroup", "--path", "protonvpn_exclude", "-j", "MARK", "--set-mark", "51820"]), capture_output=True)
-                    subprocess.run(self._elevate(["ip", "rule", "del", "fwmark", "51820", "table", "200"]), capture_output=True)
-                    subprocess.run(self._elevate(["rmdir", "/sys/fs/cgroup/protonvpn_exclude"]), capture_output=True)
+
+                # Objects created by builds that predate the split subsystem.
+                subprocess.run(self._elevate(["iptables", "-t", "mangle", "-D", "OUTPUT", "-m", "cgroup", "--path", "protonvpn_exclude", "-j", "MARK", "--set-mark", "51820"]), capture_output=True)
+                subprocess.run(self._elevate(["ip", "rule", "del", "fwmark", "51820", "table", "200"]), capture_output=True)
+                subprocess.run(self._elevate(["rmdir", "/sys/fs/cgroup/protonvpn_exclude"]), capture_output=True)
                 
                 subprocess.run(self._elevate(["ip", "route", "del", "0.0.0.0/1"]), capture_output=True)
                 subprocess.run(self._elevate(["ip", "route", "del", "128.0.0.0/1"]), capture_output=True)

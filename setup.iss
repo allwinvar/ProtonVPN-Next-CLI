@@ -54,6 +54,7 @@ Name: installObfuscation; Description: "{cm:installObfuscationDesc}"; Flags: che
 ; Run firewall configuration if task selected
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""PVPN-Next CLI"" dir=in action=allow program=""{app}\pvpn-next-windows.exe"" enable=yes"; Flags: runhidden; Tasks: addFirewall
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""PVPN-Next Engine"" dir=in action=allow program=""{app}\engine\pvpn-engine.exe"" enable=yes"; Flags: runhidden; Tasks: addFirewall
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""PVPN-Next Split Tunneling"" dir=in action=allow program=""{app}\engine\pvpn-split.exe"" enable=yes"; Flags: runhidden; Tasks: addFirewall
 
 ; Enable/disable daemon settings in database by running the CLI command
 Filename: "{app}\pvpn-next-windows.exe"; Parameters: "daemon on"; Flags: runhidden; Tasks: enableDaemon
@@ -64,6 +65,12 @@ Filename: "{app}\pvpn-next-windows.exe"; Parameters: "_install-watchdog"; Flags:
 
 ; Configure default AmneziaWG obfuscation preset if selected
 Filename: "{app}\pvpn-next-windows.exe"; Parameters: "awg-config set vpn-next-default"; Flags: runhidden; Tasks: installObfuscation
+
+[UninstallRun]
+; Remove split-tunneling routes, marks and the WinDivert driver service before
+; the files disappear, so an uninstall cannot leave the network half-configured.
+Filename: "{app}\pvpn-next-windows.exe"; Parameters: "split-tunneling reconcile"; Flags: runhidden; RunOnceId: "SplitReconcile"
+Filename: "{sys}\sc.exe"; Parameters: "delete WinDivert"; Flags: runhidden; RunOnceId: "WinDivertService"
 
 [Registry]
 ; Run watchdog on Windows logon (startup) if task selected

@@ -138,11 +138,23 @@ def do_status():
     else:
         print("[Cert]   Status:  Not Registered")
         
-    split_config = get_split_tunnel_config()
-    items_count = len(split_config.get("split_items", []))
-    exc_lan = split_config.get("exclude_lan", False)
-    if items_count > 0 or exc_lan:
-        print(f"[Split]  Status:  Active (LAN Excluded: {'Yes' if exc_lan else 'No'}, {items_count} items)")
+    from pvpn_cli.split import manager as split_manager
+
+    split_status = split_manager.status(db=db)
+    if split_status["enabled"]:
+        counts = split_status["counts"]
+        print(
+            "[Split]  Status:  {state} ({mode} mode, LAN excluded: {lan}, "
+            "{apps} apps, {ips} networks, {domains} domains)".format(
+                state="Active" if split_status["active"] else "Configured",
+                mode=split_status["mode"],
+                lan="Yes" if split_status["exclude_lan"] else "No",
+                **counts,
+            )
+        )
+        health = split_status.get("health") or {}
+        if split_status["active"] and not health.get("ok", True):
+            print("[Split]  Health:  degraded, run 'split-tunneling reconcile'")
     else:
         print("[Split]  Status:  Disabled")
     

@@ -1137,6 +1137,16 @@ def update_settings():
             print(msg, flush=True)
             messages.append(msg)
 
+    # Keep both persistence layers in sync. Older builds used the database for
+    # the master switch while the new schema also records it in the JSON file.
+    if "split_tunneling" in data:
+        from pvpn_cli.split.model import set_master_enabled
+
+        set_master_enabled(
+            str(data["split_tunneling"]).strip().lower() == "true",
+            db=db,
+        )
+
     # Mirror GUI-facing keys onto the ones the connection path actually reads.
     if "obfuscation_enabled" in data or "obfuscation_config" in data:
         msg = sync_obfuscation_to_engine(db)
@@ -1150,6 +1160,7 @@ def update_settings():
     return jsonify({"success": True, "messages": messages})
 
 def load_split_config_file(config_path):
+    """Deprecated: kept for callers that still read the raw file."""
     if os.path.exists(config_path):
         try:
             with open(config_path, "r") as f:
@@ -1161,35 +1172,114 @@ def load_split_config_file(config_path):
     return {}
 
 
+def _split_payload():
+    """Everything the GUI needs to draw the split tunneling screens."""
+    from pvpn_cli.split import manager as split_manager
+    from pvpn_cli.split import model as split_model
+
+    config = split_model.load_config()
+    status = split_manager.status()
+    return {
+        "version": config.get("version"),
+        "enabled": config.get("enabled", False),
+        "mode": config.get("mode"),
+        "exclude_lan": config.get("exclude_lan", False),
+        "items": config.get("items", []),
+        # Legacy shape, so an older window still renders the list correctly.
+        "split_items": [
+            {"type": item["type"], "value": item["value"]}
+            for item in config.get("items", [])
+            if item.get("enabled", True)
+        ],
+        "capabilities": split_manager.capabilities(),
+        "status": status,
+    }
+
+
 @app.route("/api/settings/split", methods=["GET"])
 def get_split_settings():
-    from pvpn_cli.routing import get_config_dir
-    config_path = os.path.join(get_config_dir(), "split_tunnel.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r") as f:
-                return jsonify(json.load(f))
-        except:
-            pass
-    return jsonify({"exclude_lan": False, "split_items": []})
+    return jsonify(_split_payload())
+
 
 @app.route("/api/settings/split", methods=["POST"])
 def update_split_settings():
-    from pvpn_cli.routing import get_config_dir
+    """Update the configuration and push it onto a live connection.
+
+    Saving used to write the GUI payload straight to disk and stop there, so an
+    invalid entry was stored happily and nothing changed until a reconnect.
+    """
+    from pvpn_cli.split import manager as split_manager
+    from pvpn_cli.split import model as split_model
+
     data = request.json or {}
-    config_path = os.path.join(get_config_dir(), "split_tunnel.json")
-    # The GUI only knows about mode/split_items, so merge instead of replacing:
-    # a plain dump drops CLI-owned keys such as exclude_lan on every save.
-    merged = load_split_config_file(config_path)
-    merged.update(data)
     try:
-        with open(config_path, "w") as f:
-            json.dump(merged, f, indent=4)
-        msg = f"-> Split Tunneling configuration updated ({len(data.get('split_items', []))} items)"
-        print(msg, flush=True)
-        return jsonify({"success": True, "message": msg})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 400
+        config = split_model.update_config(data)
+    except split_model.SplitConfigError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+    messages = [
+        "-> Split Tunneling configuration updated "
+        f"({len(config.get('items', []))} items, {config.get('mode')} mode)"
+    ]
+    print(messages[0], flush=True)
+
+    state = split_model.read_state()
+    if state and split_manager.engine_running():
+        try:
+            result = split_manager.apply(
+                tunnel_interface=state.get("tunnel_interface") or "awg0",
+                tunnel_ip4=state.get("tunnel_ip4"),
+                tunnel_ip6=state.get("tunnel_ip6"),
+                log=lambda message: print(message, flush=True),
+            )
+            messages.append("-> Applied to the active connection")
+            for warning in result.get("warnings", []):
+                messages.append(f"[WARNING] {warning}")
+        except Exception as exc:
+            messages.append(f"[WARNING] Could not update the active connection: {exc}")
+
+    payload = _split_payload()
+    payload.update({"success": True, "message": messages[0], "messages": messages})
+    return jsonify(payload)
+
+
+@app.route("/api/settings/split/reconcile", methods=["POST"])
+def reconcile_split_settings():
+    """Drop split tunneling leftovers, e.g. after an unclean shutdown."""
+    from pvpn_cli.split import manager as split_manager
+
+    result = split_manager.reconcile(log=lambda message: print(message, flush=True))
+    return jsonify({"success": True, **result})
+
+
+@app.route("/api/settings/split/processes", methods=["GET"])
+def list_split_processes():
+    """Running user applications, for the application picker."""
+    from pvpn_cli.split import manager as split_manager
+
+    try:
+        return jsonify({"success": True, "processes": split_manager.list_processes()})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc), "processes": []})
+
+
+@app.route("/api/settings/split/validate", methods=["POST"])
+def validate_split_item():
+    """Check one entry before it is added, so the GUI can explain refusals."""
+    from pvpn_cli.split import model as split_model
+
+    data = request.json or {}
+    value = (data.get("value") or "").strip()
+    item_type = data.get("type") or split_model.guess_type(value)
+    if not value:
+        return jsonify({"success": False, "error": "A value is required"}), 400
+    try:
+        normalized = split_model.normalize_value(item_type, value)
+    except split_model.SplitConfigError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    return jsonify({"success": True, "type": item_type, "value": normalized})
 
 @app.route("/api/awg", methods=["GET"])
 def get_awg_configs():
@@ -1623,6 +1713,18 @@ def run_api_server(port=34115, debug=False, api_token=None):
     # Start location tracker
     locator = threading.Thread(target=location_tracker, daemon=True)
     locator.start()
+
+    # A reboot or a crash leaves the split-tunneling state file behind while
+    # every route and helper process is already gone. Reconciling here is what
+    # makes the feature survive a restart instead of appearing dead.
+    try:
+        from pvpn_cli.split import manager as split_manager
+
+        outcome = split_manager.reconcile(log=lambda message: print(message, flush=True))
+        if outcome.get("cleaned"):
+            print("-> Cleared split tunneling leftovers from a previous session.", flush=True)
+    except Exception as exc:
+        print(f"[WARNING] Split tunneling reconcile failed: {exc}", flush=True)
 
     print(f"Starting API Daemon on port {port} (Debug: {debug})...", flush=True)
     try:
