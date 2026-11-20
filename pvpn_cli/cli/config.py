@@ -80,4 +80,6 @@ def get_base_dir() -> str:
 
 def get_engine_path() -> str:
     engine_name = "pvpn-engine.exe" if platform.system() == "Windows" else "pvpn-engine"
+    if getattr(sys, 'frozen', False):
+        return os.path.abspath(os.path.join(get_base_dir(), engine_name))
     return os.path.abspath(os.path.join(get_base_dir(), "engine", engine_name))
